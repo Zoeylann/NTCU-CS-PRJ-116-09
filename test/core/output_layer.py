@@ -1,18 +1,10 @@
 import time
 import os
+import threading
 import requests
 import config
 
 class OutputLayer:
-    """
-    負責所有對外輸出：
-      1. 終端機彩色列印
-      2. LINE Notify 推播（填入 token 後生效）
-      3. 語意化事故摘要（呼叫本地 Ollama SLM）
-      4. 防重複通報（同等級警報 30 秒內只發一次）
-    """
-
-    # ANSI 終端機顏色
     _COLORS = {
         "HIGH":   "\033[91m",  # 紅
         "MEDIUM": "\033[93m",  # 黃
@@ -21,122 +13,121 @@ class OutputLayer:
     }
 
     def __init__(self, location: str):
-        self._location      = location
-        self._last_alert_time  = 0.0
+        self._location = location
+        self._last_alert_time = 0.0
         self._last_alert_level = ""
-        self._cooldown_sec  = 30  # 同等級警報的冷卻秒數
+        self._cooldown_sec = 20
 
-    # ── 主要介面 ───────────────────────────────────
-    def alert(self, X, P: float, level: str):
-        """
-        當風險 P >= RISK_HIGH 時由 main.py 呼叫。
-        依序執行：列印 → 生成摘要 → 推播。
-        """
+    def alert(self, X, P: float, level: str, people_details: list = None):
+        """非同步警報發送：不卡頓主迴圈"""
         if not self._should_send(level):
-            return  # 冷卻中，跳過
+            return
 
-        timestamp = time.strftime("%H:%M:%S")
-        summary   = self._generate_summary(X, P, level, timestamp)
-
-        self._print_alert(level, P, summary, timestamp)
-        self._send_line_notify(level, summary)
-        # 若有前端 WebSocket，可在這裡加 self._send_ws(...)
-
-        self._last_alert_time  = time.time()
+        self._last_alert_time = time.time()
         self._last_alert_level = level
+        timestamp = time.strftime("%H:%M:%S")
 
-    def log_status(self, P: float, level: str):
-        """
-        每次決策都呼叫（LOW / MEDIUM 也會跑到），
-        只印一行狀態，不觸發推播。
-        """
-        color = self._COLORS.get(level, "")
-        reset = self._COLORS["RESET"]
-        print(f"[{time.strftime('%H:%M:%S')}] "
-              f"{color}[{level}]{reset} P={P:.3f}")
+        threading.Thread(
+            target=self._async_alert_worker,
+            args=(list(X), P, level, timestamp, people_details or []),
+            daemon=True
+        ).start()
 
-    # ── 冷卻判斷 ───────────────────────────────────
+    def _async_alert_worker(self, X, P: float, level: str, timestamp: str, people_details: list):
+        summary = self._generate_summary(X, P, level, timestamp, people_details)
+        self._print_alert(level, P, summary, timestamp)
+        self._send_line_message(summary)
+
     def _should_send(self, level: str) -> bool:
-        now     = time.time()
+        now = time.time()
         elapsed = now - self._last_alert_time
-        # 等級升高時立刻發（MEDIUM → HIGH 不需等冷卻）
         level_rank = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
         if level_rank.get(level, 0) > level_rank.get(self._last_alert_level, 0):
             return True
         return elapsed >= self._cooldown_sec
 
-    # ── 語意摘要（Ollama 本地 SLM）────────────────
-    def _generate_summary(self, X, P: float, level: str,
-                           timestamp: str) -> str:
-        """
-        呼叫本地 Ollama（phi3:mini 或 llama3.2:1b）。
-        若 Ollama 未安裝或逾時，回傳預設文字。
-        """
-        weapon_s  = round(float(max(X[0], X[1])), 2)
-        pose_s    = round(float(max(X[5], X[6])), 2)
-        emotion_s = round(float(max(X[10], X[11])), 2)
-        audio_s   = round(float(max(X[15], X[16])), 2)
+    def _generate_summary(self, X, P: float, level: str, timestamp: str, people_details: list) -> str:
+        """強制要求小型 LLM 輸出純條列結構，無任何開場與結尾廢話"""
+        date_str = time.strftime("%Y-%m-%d")
+        
+        # 整理數值特徵
+        threats = []
+        if X[0] > 0.4: threats.append(f"持致命武器 (信心度 {X[0]*100:.0f}%)")
+        if X[1] > 0.4: threats.append(f"持危險工具 (信心度 {X[1]*100:.0f}%)")
+        if X[3] > 0.5 or X[4] > 0.5: threats.append(f"肢體衝突/異常姿態 (信心度 {max(X[3], X[4])*100:.0f}%)")
+        if X[9] > 0.5 or X[10] > 0.5: threats.append(f"異常聲響/求救聲 (信心度 {max(X[9], X[10])*100:.0f}%)")
+        threat_info = "、".join(threats) if threats else "多模態綜合異常"
+        people_info = "；".join(people_details) if people_details else "無特定目標特徵"
 
         prompt = (
-            "你是校園安全通報系統。根據以下感測數據，"
-            "用繁體中文生成一句簡短通報（30字以內），"
-            "不要有前言，直接輸出通報內容：\n"
-            f"地點：{self._location}，時間：{timestamp}\n"
-            f"武器威脅：{weapon_s}，動作威脅：{pose_s}，"
-            f"情緒威脅：{emotion_s}，聲音威脅：{audio_s}\n"
-            f"綜合風險：{P:.2f}（{level}）"
+            "你是校安通報中心。請根據以下數據生成純條列通報，禁止任何前言、開場白與結語，格式必須完全符合：\n"
+            f"地點：{self._location}\n"
+            f"時間：{date_str} {timestamp}\n"
+            f"風險等級：{level} (P={P:.2f})\n"
+            f"威脅指標：{threat_info}\n"
+            f"目標狀態：{people_info}\n\n"
+            "請嚴格依據以下範例格式輸出：\n"
+            "【🚨 校安緊急警報】\n"
+            "📍 地點：[地點]\n"
+            "⏰ 時間：[時間]\n"
+            "⚠️ 等級：[等級與指數]\n"
+            "🎯 威脅：[主要威脅與武器]\n"
+            "👥 目標：[人數與動作狀態]\n"
+            "👉 指示：[給警衛的一句處置指示]"
         )
 
         try:
             resp = requests.post(
                 "http://localhost:11434/api/generate",
                 json={"model": "phi3:mini", "prompt": prompt, "stream": False},
-                timeout=5  # 最多等 5 秒，避免拖慢主迴圈
+                timeout=2.5
             )
             if resp.status_code == 200:
-                return resp.json().get("response", "").strip()
+                result = resp.json().get("response", "").strip()
+                if "📍" in result or "•" in result:
+                    return result
         except requests.exceptions.RequestException:
-            pass  # Ollama 未啟動時靜默失敗
+            pass
 
-        # 預設摘要（Ollama 不可用時）
-        dominant = max(
-            [("武器", weapon_s), ("動作", pose_s),
-             ("情緒", emotion_s), ("聲音", audio_s)],
-            key=lambda x: x[1]
+        # 備援規則模板：若 LLM 沒開或逾時，直接輸出極簡條列
+        return (
+            f"【🚨 校安緊急警報】\n"
+            f"📍 地點：CAM-01 ({self._location})\n"
+            f"⏰ 時間：{date_str} {timestamp}\n"
+            f"⚠️ 等級：{level} (P={P:.2f})\n"
+            f"🎯 威脅：{threat_info}\n"
+            f"👥 目標：{people_info}\n"
+            f"👉 指示：請值班警衛立即攜帶裝備前往現場！"
         )
-        return (f"【{level}】{self._location} {timestamp} "
-                f"偵測到異常{dominant[0]}行為，請立即確認。")
 
-    # ── 終端機彩色輸出 ─────────────────────────────
-    def _print_alert(self, level: str, P: float,
-                     summary: str, timestamp: str):
+    def _print_alert(self, level: str, P: float, summary: str, timestamp: str):
         color = self._COLORS.get(level, "")
         reset = self._COLORS["RESET"]
         sep   = "=" * 55
         print(f"\n{color}{sep}")
-        print(f"  🚨 {level} 警報  P={P:.3f}  {timestamp}")
-        print(f"  {summary}")
+        print(f"  🚨 {level} 警報觸發  {timestamp}")
+        print(f"{summary}")
         print(f"{sep}{reset}\n")
 
-    # ── LINE Notify 推播 ───────────────────────────
-    def _send_line_notify(self, level: str, summary: str):
-        """
-        填入 config.ALERT_WEBHOOK_URL（LINE Notify token）後生效。
-        取得 token：https://notify-bot.line.me/my/
-        """
-        token = getattr(config, "ALERT_WEBHOOK_URL", "")
-        if not token:
-            return  # 未設定則跳過
+    def _send_line_message(self, message_text: str):
+        token = getattr(config, "LINE_CHANNEL_ACCESS_TOKEN", "")
+        user_id = getattr(config, "LINE_USER_ID", "")
+        if not token or not user_id:
+            return
 
-        emoji = {"HIGH": "🚨", "MEDIUM": "⚠️", "LOW": "ℹ️"}.get(level, "")
-        message = f"\n{emoji} {summary}"
+        url = "https://api.line.me/v2/bot/message/push"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}"
+        }
+        payload = {
+            "to": user_id,
+            "messages": [{"type": "text", "text": message_text}]
+        }
 
         try:
-            requests.post(
-                "https://notify-api.line.me/api/notify",
-                headers={"Authorization": f"Bearer {token}"},
-                data={"message": message},
-                timeout=5
-            )
+            resp = requests.post(url, headers=headers, json=payload, timeout=4)
+            if resp.status_code != 200:
+                print(f"[LINE Bot] 發送失敗 ({resp.status_code}): {resp.text}")
         except requests.exceptions.RequestException as e:
-            print(f"[LINE Notify] 發送失敗：{e}")
+            print(f"[LINE Bot] 連線失敗：{e}")
